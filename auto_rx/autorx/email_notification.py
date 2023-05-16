@@ -4,6 +4,7 @@
 #
 #   Copyright (C) 2018 Philip Heron <phil@sanslogic.co.uk>
 #   Released under GNU GPL v3 or later
+#   Vigor Geslin 2022
 
 import datetime
 import logging
@@ -147,13 +148,15 @@ class EmailNotification(object):
                     msg += "Callsign:  %s\n" % _id
                     msg += "Type:      %s\n" % telemetry["type"]
                     msg += "Frequency: %s\n" % telemetry["freq"]
-                    msg += "Position:  %.5f,%.5f\n" % (
-                        telemetry["lat"],
-                        telemetry["lon"],
-                    )
-                    msg += "Altitude:  %d m\n" % round(telemetry["alt"])
+                    if not 'encrypted' in telemetry:
+                        msg += "Position:  %.5f,%.5f\n" % (
+                            telemetry["lat"],
+                            telemetry["lon"],
+                        )
+                        msg += "Altitude:  %d m\n" % round(telemetry["alt"])
 
-                    if self.station_position != None:
+
+                    if self.station_position != None and not 'encrypted' in telemetry:
                         _relative_position = position_info(
                             self.station_position,
                             (telemetry["lat"], telemetry["lon"], telemetry["alt"]),
@@ -184,7 +187,7 @@ class EmailNotification(object):
                 except Exception as e:
                     self.log_error("Error sending E-mail - %s" % str(e))
 
-        else:
+        elif "encrypted" not in telemetry:
             # Update track data.
             _sonde_state = self.sondes[_id]["track"].add_telemetry(
                 {
