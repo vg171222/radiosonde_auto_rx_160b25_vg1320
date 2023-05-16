@@ -4,6 +4,7 @@
 #
 #   Copyright (C) 2018  Mark Jessop <vk5qi@rfhead.net>
 #   Released under GNU GPL v3 or later
+#   Copyright (C) 2022  Vigor Geslin
 #
 import autorx
 import datetime
@@ -23,6 +24,7 @@ from .gps import get_ephemeris, get_almanac
 from .sonde_specific import fix_datetime, imet_unique_id
 from .fsk_demod import FSKDemodStats
 from .sdr_wrappers import test_sdr, get_sdr_iq_cmd, get_sdr_fm_cmd, get_sdr_name
+from autorx.email_notification import EmailNotification
 
 # Global valid sonde types list.
 VALID_SONDE_TYPES = [
@@ -1240,6 +1242,7 @@ class SondeDecoder(object):
 
         # Timeout Counter.
         _last_packet = time.time()
+        _goodPrevLine = ""
 
         if self.decoder_command_2 is None:
             # No second decoder command, so we only need to process stdout from the one process.
@@ -1302,6 +1305,7 @@ class SondeDecoder(object):
 
                     # If we decoded a valid JSON blob, update our last-packet time.
                     if _ok:
+                        _goodPrevLine = _line
                         _last_packet = time.time()
 
             # Check timeout counter.
@@ -1338,6 +1342,116 @@ class SondeDecoder(object):
                     self.demod_process.kill()
             except Exception as e:
                 self.log_debug("SIGKILL via subprocess.kill failed - %s" % str(e))
+            # If the telemetry is OK, send to the exporter functions (if we have any).
+            if self.exporters is None:
+                return
+            else:
+                if len(_goodPrevLine) > 0 :
+                    _telemetry = json.loads(_goodPrevLine.decode("ascii"))
+                    if "encrypted" in _telemetry:
+                        if _telemetry["encrypted"]:
+                            if 'subtype' in _telemetry:
+                                if self.sonde_type == 'RS41':
+                                    # For RS41 sondes, we are provided with a more specific subtype string (RS41-SG, RS41-SGP, RS41-SGM)
+                                    # in the subtype field, so we can use this directly.
+                                    _telemetry['type'] = _telemetry['subtype']
+                                else:
+                                    # For other sonde types, we leave the type field as it is, even if we are provided
+                                    # a subtype field. (This shouldn't happen)
+                                    _telemetry['type'] = self.sonde_type
+                            if self.sonde_type == 'RS41':
+                                _telemetry['freq_float'] = self.sonde_freq/1e6
+                                _telemetry['freq'] = "%.3f MHz" % (self.sonde_freq/1e6)
+                                
+                                dtvg = datetime.datetime.now(datetime.timezone.utc)
+                                _telemetry["datetime_dt"] = dtvg
+                                for _exporter in self.exporters:
+                                    try:
+                                        if _exporter.__self__.__module__ == EmailNotification.__module__:
+                                            _exporter(_telemetry)
+                                    except Exception as e:
+                                        self.log_error("Exporter Error %s" % str(e))
+                    elif "encrypted" not in _telemetry:
+                        _telemetry['freq_float'] = self.sonde_freq/1e6
+                        _telemetry['freq'] = "%.3f MHz" % (self.sonde_freq/1e6)
+                        
+                        dtvg = datetime.datetime.now(datetime.timezone.utc)
+                        _telemetry["datetime_dt"] = dtvg
+                        
+                        if _telemetry["id"] == "iMet" :
+                            # Check we have GPS lock.
+                            if _telemetry["sats"] < 4:
+                                # No GPS lock means an invalid time, which means we can't accurately calculate a unique ID.
+                                # We need to quit at this point before the telemetry processing gos any further.
+                                self.log_error("iMet sonde has no GPS lock - discarding frame.")
+                                return False
+
+                            # Fix up the time.
+                            _telemetry["datetime_dt"] = fix_datetime(_telemetry["datetime"])
+
+                            # An attempt at detecting iMet-1 vs iMet-4 sondes based on how the frame count increments
+                            # compared to the time.
+                            # Note that this is going to break horribly if an iMet-1 and an iMet-4 are on the same frequency,
+                            # or if there are multiple iMet-4's in the air when this is performed. I don't have a nice
+                            # solution to that second problem.
+                            # This may also break when running in UDP mode for long periods.
+                            if self.imet_type is None:
+                                if self.imet_prev_frame is None:
+                                    self.imet_prev_frame = _telemetry['frame']
+                                    self.imet_prev_time = _telemetry["datetime_dt"]
+                                    self.log_info("Waiting for additional frames to determine iMet type (1 or 4)")
+                                    return False
+                                else:
+                                    # Calculate and compare frame vs time deltas.
+                                    _time_delta = (_telemetry["datetime_dt"] - self.imet_prev_time).total_seconds()
+                                    _frame_delta = _telemetry['frame'] - self.imet_prev_frame
+
+                                    if _time_delta == _frame_delta//2:
+                                        # Frame counter increments at twice the rate of the time counter = iMet-1
+                                        self.log_info("iMet sonde is most likely an iMet-1")
+                                        self.imet_type = "iMet-1"
+                                    elif _time_delta == _frame_delta:
+                                        # Frame counter increments at the same rate as the time counter = iMet-4
+                                        self.log_info("iMet sonde is most likely an iMet-4")
+                                        self.imet_type = "iMet-4"
+                                    else:
+                                        # Some other case (possibly 2 sondes on the same frequency?)
+                                        # Assume iMet-4...
+                                        self.log_info("iMet sonde is most likely an iMet-4 (less confidence)")
+                                        self.imet_type = "iMet-4"
+                            else:
+                                _telemetry['subtype'] = self.imet_type
+                            
+                            # Generate a unique ID based on the power-on time and frequency, as iMet sonde telemetry is painful
+                            # and doesn't send any ID. 
+                            _new_imet_id = imet_unique_id(_telemetry, imet1=(self.imet_type=="iMet-1"))
+
+                            # If we have seen this ID before, keep using it.
+                            if _new_imet_id in self.imet_id:
+                                _telemetry["id"] = _new_imet_id
+                            else:
+                                # We have seen less than 4 different IDs while this decoder has been runing.
+                                # Accept that this may be a new iMet sonde, and add the ID to the iMet ID list.
+                                if len(self.imet_id) < self.imet_max_ids:
+                                    self.imet_id.append(_new_imet_id)
+                                    _telemetry["id"] = _new_imet_id
+                                else:
+                                    # We have seen see many IDs this decode run, suspect this is likely an old iMet-1
+                                    # Which doesn't have a useful frame counter.
+                                    self.log_error("Exceeded maximum number of iMet sonde IDs for a decoder (4) - discarding this frame.")
+                                    return False
+
+                            # Re-generate the datetime string.
+                            _telemetry["datetime"] = _telemetry["datetime_dt"].strftime(
+                                "%Y-%m-%dT%H:%M:%SZ"
+                            )
+                        for _exporter in self.exporters:
+                            try:
+                                if _exporter.__self__.__module__ == EmailNotification.__module__:
+                                    _exporter(_telemetry)
+                            except Exception as e:
+                                self.log_error("Exporter Error %s" % str(e))
+                self.exit_state = "OK"
             # Finally, join the async reader.
             self.async_reader.join()
 
@@ -1420,13 +1534,11 @@ class SondeDecoder(object):
             # trying to decode this, so we close the decoder at this point.
             if "encrypted" in _telemetry:
                 if _telemetry["encrypted"]:
-                    self.log_error(
+                    self.log_debug(
                         "Radiosonde %s has encrypted telemetry (Possible encrypted RS41-SGM)! We cannot decode this, closing decoder."
                         % _telemetry["id"]
                     )
                     self.exit_state = "Encrypted"
-                    self.decoder_running = False
-                    return False
 
             # Check the datetime field is parseable.
             try:
@@ -1436,7 +1548,18 @@ class SondeDecoder(object):
                     "Invalid date/time in telemetry dict - %s (Sonde may not have GPS lock)"
                     % str(e)
                 )
-                return False
+                if self.exit_state == "Encrypted":
+                    dtvg = datetime.datetime.now(datetime.timezone.utc)
+                    _telemetry["datetime_dt"] = dtvg
+                    _telemetry["datetime"] = dtvg.strftime("%d-%m-%yT%H:%M:%S.%f")[:-3]+"Z"
+                    self.log_debug(
+                        "datetime_dt corrected %s (Possible RS41-SGM)" % str(_telemetry["datetime_dt"])
+                    )
+                    self.log_debug(
+                        "datetime corrected %s (Possible RS41-SGM)" % str(_telemetry["datetime"])
+                    )
+                else:
+                    return False
 
             if self.udp_mode:
                 # If we are accepting sondes via UDP, we make use of the 'type' field provided by
@@ -1445,7 +1568,7 @@ class SondeDecoder(object):
 
                 # If frequency has been provided, make used of it.
                 # Frequency must be supplied in kHz!
-                if "freq" in _telemetry:
+                if "freq" in _telemetry and not "encrypted" in _telemetry :
                     self.sonde_freq = float(_telemetry["freq"]) * 1e3
 
             # Add in the sonde type field.
@@ -1624,7 +1747,7 @@ class SondeDecoder(object):
             _telem_ok = "OK"
             if self.telem_filter is not None:
                 try:
-                    _telem_ok = self.telem_filter(_telemetry)
+                    _telem_ok = self.telem_filter(_telemetry, self.exit_state)
                 except Exception as e:
                     self.log_error("Failed to run telemetry filter - %s" % str(e))
                     return False
