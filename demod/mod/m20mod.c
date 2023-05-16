@@ -107,6 +107,7 @@ typedef struct {
     ui8_t utc_ofs;
     char SN[12+4];
     ui8_t SNraw[3];
+    float batV;
     ui8_t frame_bytes[FRAME_LEN+AUX_LEN+4];
     char frame_bits[BITFRAME_LEN+BITAUX_LEN+8];
     int auxlen; // ? 0 .. 0x57-0x45
@@ -215,6 +216,7 @@ frame[0x44..0x45]: frame check
 #define pos_GPSvN     0x0D  // 2 byte
 #define pos_GPSvU     0x18  // 2 byte
 #define pos_SN        0x12  // 3 byte
+#define pos_BV        0x26	// 1 byte - Battery Voltage
 #define pos_CNT       0x15  // 1 byte
 #define pos_BlkChk    0x16  // 2 byte
 #define pos_Check     (stdFLEN-1)  // 2 byte
@@ -249,6 +251,19 @@ frame[0x44..0x45]: frame check
 #define col_CSoo       "\x1b[38;5;220m"
 #define col_CSno       "\x1b[38;5;1m"
 #define col_CNST       "\x1b[38;5;58m"  // 3 byte
+
+// Battery Level
+static int get_BatteryLevel(gpx_t *gpx) {
+    double batteryVoltage = 0.0;
+    
+    batteryVoltage = gpx->frame_bytes[pos_BV] ;
+
+    gpx->batV = batteryVoltage * 0.01316f ;
+    
+    if (gpx->batV < (0.0) || gpx->batV > 4.0) return -1;
+
+    return 0;
+}
 
 /*
 $ for code in  {0..255}
@@ -734,6 +749,7 @@ static int print_pos(gpx_t *gpx, int bcOK, int csOK) {
             gpx->TH  = get_Tntc2(gpx); // rel. humidity sensor temperature
             gpx->RH = get_RH(gpx);     // relative humidity
             gpx->P  = get_P(gpx);      // (optional) pressure
+            get_BatteryLevel(gpx);
         }
 
         if ( !gpx->option.slt )
@@ -855,6 +871,7 @@ static int print_pos(gpx_t *gpx, int bcOK, int csOK) {
                     ver_jsn = VER_JSN_STR;
                 #endif
                 if (ver_jsn && *ver_jsn != '\0') fprintf(stdout, ", \"version\": \"%s\"", ver_jsn);
+                fprintf(stdout, ", \"batt\": %.2f", gpx->batV);
                 fprintf(stdout, " }\n");
                 fprintf(stdout, "\n");
             }
