@@ -3,6 +3,7 @@
 #   Radiosonde Auto RX Service - V2.0
 #
 #   Copyright (C) 2018  Mark Jessop <vk5qi@rfhead.net>
+#   Copyright (C) 2022  Vigor Geslin
 #   Released under GNU GPL v3 or later
 #
 #   Refer github page for instructions on setup and usage.
@@ -505,7 +506,7 @@ def stop_all():
         gpsd_adaptor.close()
 
 
-def telemetry_filter(telemetry):
+def telemetry_filter(telemetry, _exit_state):
     """Filter incoming radiosonde telemetry based on various factors,
         - Invalid Position
         - Invalid Altitude
@@ -519,7 +520,7 @@ def telemetry_filter(telemetry):
     global config
 
     # First Check: zero lat/lon
-    if (telemetry["lat"] == 0.0) and (telemetry["lon"] == 0.0):
+    if (telemetry["lat"] == 0.0) and (telemetry["lon"] == 0.0) and (not _exit_state == "Encrypted") and (not telemetry["type"] == "RS41-SGM"):
         logging.warning(
             "Zero Lat/Lon. Sonde %s does not have GPS lock." % telemetry["id"]
         )
@@ -535,7 +536,7 @@ def telemetry_filter(telemetry):
         return False
 
     # Third check: Number of satellites visible.
-    if "sats" in telemetry:
+    if "sats" in telemetry and not (_exit_state == "Encrypted") and not (telemetry["type"] == "RS41-SGM"):
         if telemetry["sats"] < 4:
             logging.warning(
                 "Sonde %s can only see %d GNSS sats - discarding position as bad."
